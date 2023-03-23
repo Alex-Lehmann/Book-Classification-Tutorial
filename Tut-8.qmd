@@ -1,0 +1,194 @@
+---
+title: "STAT 4601/5703 Tutorial 8"
+author: "Alex Lehmann"
+format: pdf
+editor: visual
+---
+
+## Introduction
+
+In this tutorial, we will employ both supervised and unsupervised learning to classify text by its source. More specifically, we will use topic modeling and a $k$-nearest neighbors classifier to sort chapters of three classic English-language novels into the correct titles. In the process, we will see applications of the topic modeling theory discussed in last week's tutorial as well as gain exposure to useful programming tools such as regular expressions and revisit some concepts from prior lessons as well.
+
+::: callout-note
+## The topic modeling example below comes is a modified version of an example given in Text Mining with R: A Tidy Approach by Silge and Robinson. See their work for more on the topic.
+:::
+
+## Setup
+
+```{r}
+#| label: packages
+#| warning: false
+
+library(tidyverse)
+library(gutenbergr) # Books!
+library(tm) # Text mining objects
+library(textstem) # Stemming and lemmatizing utilities
+library(topicmodels)
+library(tidytext) # Tidy wrangling and cleaning tools for text data
+library(tidymodels)
+```
+
+## Data Acquisition and Preprocessing
+
+The dataset for this tutorial consists of the complete texts of three classic novels: Jules Verne's *Twenty Thousand Leagues under the Sea*, Jane Austen's *Pride and Prejudice*, and Charles Dickens' *Great Expectations*. Fortunately, Project Gutenberg offers a free API to download the complete text of thousands of public-domain books and the `gutenbergr` package provides an R interface to access it.
+
+```{r}
+#| label: download
+#| warning: false
+
+titles <- c("Twenty Thousand Leagues under the Sea",
+            "Pride and Prejudice",
+            "Great Expectations")
+books <- gutenbergr::gutenberg_works(title %in% titles) %>%
+  gutenbergr::gutenberg_download(meta_fields = "title")
+```
+
+Our task today is to classify the chapters of these books, so let's organize them by chapter. The Gutenberg text contains chapter labels, so we can use a *regular expression* to find each chapter heading and collect the text in between it and the next chapter heading. This lookup occurs in the `stringr::str_detect()` call below. Once we have the chapters separated, we'll break each one down into its individual words in preparation for topic modeling.
+
+```{r}
+#| label: chapters
+
+chapters <- books %>%
+  dplyr::group_by(title) %>%
+  dplyr::mutate(
+    chapter = cumsum(
+      stringr::str_detect(
+        text, stringr::regex("^chapter ", ignore_case = TRUE)
+      )
+    )
+  ) %>%
+  dplyr::ungroup() %>%
+  dplyr::filter(chapter > 0) %>%
+  tidyr::unite(document, title, chapter)
+(chapter_words <- tidytext::unnest_tokens(chapters, word, text))
+```
+
+Regular expressions ("regex") are a formal language for describing patterns in strings of written characters. They allow programmers to specify patterns, or "shapes", of characters rather than the characters themselves. This offers a more flexible way to accomplish tasks like finding all phone numbers or postal codes in a large block of text. The regular expression above, `"^chapter "`, matches every instance of the word "chapter", followed by a space, at the beginning of a line of text - this is how we're finding our chapter delineations.
+
+Now we can total up the counts of each word in each chapter. To save some time, we'll remove the stop words now. Stop words are words like "a", "the", and "and": words which are part of the language's grammatical structure but don't carry much meaning relevant to our task. We'll drop these with `anti_join()` and then count the occurrences of each word in each chapter.
+
+```{r}
+#| label: word_counts
+#| warning: false
+
+word_counts <- chapter_words %>%
+  dplyr::anti_join(tidytext::stop_words) %>%
+  dplyr::count(document, word, sort = TRUE)
+word_counts
+```
+
+Now we'll convert this count list to a document-term matrix - we're using `tidytext` to accomplish this conversion, but bear in mind that the `DocumentTermMatrix` object comes from the `tm` package.
+
+```{r}
+#| label: dtm
+
+(dtm <- tidytext::cast_dtm(word_counts, document, word, n))
+```
+
+## Topic Modeling
+
+We will now fit a topic model to the chapters of the books to construct a representation of the text that will be easier for our classifier to work with. We'll use latent Dirichlet allocation (LDA), a very popular topic model introduced in 2003. This implementation comes from the `topicmodels` package, which (by default) uses a variational expectation-maximization algorithm to fit a hierarchical Bayesian mixture model to the corpus. We know the texts come from three books, so we can use three topics to get there; in other cases, you'll need to try different numbers of topics and see how things go.
+
+```{r}
+#| label: lda
+
+(chapters_lda <- topicmodels::LDA(dtm, k = 3, control = list(seed = 1234)))
+```
+
+LDA has two main outputs we're interested in: a description of the importance of each word to each topic ($\beta$), and a description of the mixture of topics comprising each document ($\gamma$). Let's start by seeing which words are most important to which topics.
+
+```{r}
+#| label: topics
+
+topics <- tidytext::tidy(chapters_lda, matrix = "beta")
+topics %>%
+  dplyr::group_by(topic) %>%
+  dplyr::slice_max(beta, n = 5) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(term = tidytext::reorder_within(term, beta, topic)) %>%
+  ggplot2::ggplot(aes(x = beta, y = term, fill = factor(topic))) +
+  ggplot2::geom_col(show.legend = FALSE) +
+  ggplot2::facet_wrap(~ topic, scales = "free") +
+  tidytext::scale_y_reordered()
+```
+
+It looks like LDA learned the different characters involved in the three books. This makes sense: these words are the most likely distinguishing characteristics between the three books. A human reader might use this same tactic to tell the chapters apart.
+
+Now we can look at the mixtures of topics in each book. The approach is largely the same as for the topics themselves.
+
+```{r}
+#| label: mixtures
+
+mixtures <- chapters_lda %>%
+  tidytext::tidy(matrix = "gamma") %>%
+  dplyr::arrange(document)
+mixtures
+```
+
+There's some strong polarization between the topics in each chapter. That's another sign that this representation is going to be good for classification.
+
+## Classification
+
+With a helpful representation of the chapters in hand, we'll now move on to classification. We should probably start with a train-test split. Note the use of regular expressions to pull the book names out of the chapter labels to make the case labels.
+
+```{r}
+#| label: split
+
+split <- mixtures %>%
+  dplyr::mutate(
+    topic = paste0("Topic_", topic),
+    book = stringr::str_extract(document, ".+(?=_)")
+  ) %>%
+  tidyr::pivot_wider(names_from = "topic", values_from = "gamma") %>%
+  rsample::initial_split(prop = 0.5, strata = book)
+train <- rsample::training(split)
+test <- rsample::testing(split)
+```
+
+Now we'll build our model. Tidymodels supports $k$-nearest neighbor classification, so we'll use the same methods we covered previously.
+
+```{r}
+#| label: model_setup
+
+knn_model <- parsnip::nearest_neighbor(dist_power = 1) %>%
+  parsnip::set_engine("kknn") %>%
+  parsnip::set_mode("classification")
+
+knn_recipe <- recipes::recipe(
+  book ~ Topic_1 + Topic_2 + Topic_3, data = train
+)
+```
+
+Fitting the model is the same as well.
+
+```{r}
+#| label: knn_fit
+
+knn_wflow <- workflows::workflow() %>%
+  workflows::add_model(knn_model) %>%
+  workflows::add_recipe(knn_recipe)
+knn_fit <- generics::fit(knn_wflow, data = train)
+```
+
+Now we'll have our classifier try to figure out which books the test set chapters came from.
+
+```{r}
+#| label: predict
+
+(predictions <- dplyr::bind_cols(test, predict(knn_fit, test)))
+```
+
+Now let's see how many were correct.
+
+```{r}
+#| label: evaluate
+
+predictions %>%
+  dplyr::filter(book == .pred_class) %>%
+  nrow() %>%
+  `/`(nrow(test))
+```
+
+It's a perfect classification! This illustrates just how powerful topic modeling is as a machine learning tool for solving problems involving text data. This is a simple case, though - we only have three classes and there isn't a ton of overlap between the books. Adding additional books would make this problem more interesting - I encourage everyone to do so on your own time. I also encourage you to try finding a topic model for this data with more than three topics. You may be able to find a more detailed representation of these texts and being finding similarities as well as differences.
+
+© Alex Lehmann 2023. All rights reserved.
